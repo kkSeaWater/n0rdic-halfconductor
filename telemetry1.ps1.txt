@@ -1,0 +1,178 @@
+# ================== CONFIG ==================
+$Port           = "COM8"
+$Baud           = 115200
+$IntervalMs     = 1000
+$DurationSec    = 300
+$ResetCounters  = $true
+$ForceChild     = $true
+$ParentSampleEvery   = 1
+$CountersSampleEvery = 1
+
+$stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
+$Base   = Join-Path $env:USERPROFILE "Desktop"
+$LogTxt = Join-Path $Base "child_log_$stamp.txt"
+$LogCsv = Join-Path $Base "child_telemetry_$stamp.csv"
+
+# ================== SERIAL OPEN ==================
+try { if ($sp) { if ($sp.IsOpen) { $sp.Close() }; $sp.Dispose() } } catch {}
+$sp = New-Object System.IO.Ports.SerialPort $Port,$Baud,"None",8,"One"
+$sp.NewLine     = "`r`n"; $sp.Handshake   = "None"; $sp.DtrEnable   = $true
+$sp.RtsEnable   = $false; $sp.ReadTimeout = 300;    $sp.Open()
+Start-Sleep -Milliseconds 200; $sp.Write("`r`n")
+
+"==== Telemetry start $(Get-Date) ====" | Tee-Object -FilePath $LogTxt -Append | Out-Null
+"TXT log: $LogTxt" | Tee-Object -FilePath $LogTxt -Append | Out-Null
+"CSV log: $LogCsv" | Tee-Object -FilePath $LogTxt -Append | Out-Null
+
+# CSV header (with LQI/Age + TxRetry + RxErrFcs)
+"timestamp,state,parent_rloc16,parent_rloc_ipv6,lqi_in,lqi_out,age,ping_ms,tx_total,rx_total,tx_err_cca,tx_retry,rx_err_fcs" | Out-File -FilePath $LogCsv -Encoding utf8
+
+# ================== HELPERS ==================
+function Log-Line([string]$s){ $ts=Get-Date -Format "HH:mm:ss.fff"; "[$ts] $s" | Tee-Object -FilePath $LogTxt -Append | Out-Null }
+function Nz($v,$fallback){ if($null -ne $v -and $v -ne ""){$v}else{$fallback} }
+function Ensure-PortOpen(){ if(-not $sp -or -not $sp.IsOpen){ throw "Serial port is not open." } }
+
+function Send-OT([string]$cmd,[int]$timeoutMs=2000){
+  Ensure-PortOpen
+  try{$sp.DiscardInBuffer()}catch{}
+  $sp.WriteLine($cmd)
+  $deadline=(Get-Date).AddMilliseconds($timeoutMs)
+  $buf=""; Start-Sleep -Milliseconds 80
+  while((Get-Date) -lt $deadline){
+    try{$buf += $sp.ReadExisting()}catch{}
+    if($buf -match "(?m)^\s*Done\s*$" -or $buf -match "(?m)^\s*Error"){ break }
+    Start-Sleep -Milliseconds 60
+  }
+  Log-Line ("> $cmd`r`n$buf")
+  return $buf
+}
+
+function Get-State(){
+  $r=Send-OT "ot state"
+  if($r -match "(?m)^\s*(child|router|leader|detached|disabled)\s*$"){ $Matches[1] } else { "unknown" }
+}
+
+# Mesh-local prefix via 'fada' signature
+function Get-MeshLocalPrefix(){
+  $r=Send-OT "ot ipaddr"
+  $line=($r -split "`r?`n" | Where-Object { $_ -match 'fd[0-9a-f:]*fada' } | Select-Object -First 1)
+  if($line){ if($line -match '^(fd[0-9a-f:]*fada)'){ return "$($Matches[1])::" } }
+  $fallback=($r -split "`r?`n"|?{$_ -match '^(fd[0-9a-f:]+)::'}|%{($_ -replace '::.*','::')}|Select -First 1)
+  if($fallback){ return $fallback } else { return $null }
+}
+
+function Get-ParentRloc16Hex([string]$parentText=$null){
+  $p=$parentText; if(-not $p){ $p=Send-OT "ot parent" }
+  if($p -match '(?mi)\bRloc(?:16)?\s*:\s*([0-9a-f]{4})'){ $Matches[1].ToLower() } else { $null }
+}
+
+function Build-ParentRlocIPv6([string]$meshLocalPrefix,[string]$rloc16){
+  if($meshLocalPrefix -and $rloc16){ "$meshLocalPrefix" + "0:ff:fe00:$rloc16" } else { $null }
+}
+
+function Parse-Parent($text){
+  $h=@{}
+  if($text -match '(?mi)\bRloc(?:16)?\s*:\s*([0-9a-f]{4})'){ $h.rloc16=$Matches[1].ToLower() }
+  if($text -match '(?mi)Link Quality In:\s*(\d+)'){ $h.lqi_in=[int]$Matches[1] }
+  if($text -match '(?mi)Link Quality Out:\s*(\d+)'){ $h.lqi_out=[int]$Matches[1] }
+  if($text -match '(?mi)Age:\s*(\d+)'){ $h.age=[int]$Matches[1] }
+  return $h
+}
+
+function Get-Counter([string]$text,[string]$name){
+  if($text -match ("(?mi)^\s*{0}\s*:\s*(\d+)" -f [regex]::Escape($name))){ [int]$Matches[1] } else { $null }
+}
+
+# ================== ROLE SAFETY ==================
+$state=Get-State
+if($ForceChild -and $state -ne "child"){
+  Log-Line "Forcing child role (was '$state')"
+  Send-OT "ot routerrole disable" | Out-Null
+  Send-OT "ot routereligible disable" | Out-Null
+  Send-OT "ot thread stop" | Out-Null
+  Start-Sleep -Milliseconds 300
+  Send-OT "ot thread start" | Out-Null
+  for($i=0;$i -lt 20;$i++){ Start-Sleep -Milliseconds 500; $state=Get-State; if($state -eq "child"){ break } }
+  Log-Line "Role after force: $state"
+}
+
+if($ResetCounters){ Send-OT "ot counters mac reset" | Out-Null }
+
+# Baselines
+Send-OT "ot state" | Out-Null
+$parentText=Send-OT "ot parent"
+$mlPrefix=Get-MeshLocalPrefix
+$counters=Send-OT "ot counters mac"
+
+$pf=Parse-Parent $parentText
+$currentRloc16=Nz $pf.rloc16 $null
+$currentRlocIPv6=Build-ParentRlocIPv6 $mlPrefix $currentRloc16
+Log-Line ("Initial parent: RLOC16={0}, RLOCv6={1}" -f (Nz $currentRloc16 "n/a"), (Nz $currentRlocIPv6 "n/a"))
+
+# ================== PERIODIC ==================
+$iters=[math]::Ceiling(($DurationSec*1000.0)/$IntervalMs)
+for($i=0;$i -lt $iters;$i++){
+
+  $doParent=(($i % $ParentSampleEvery) -eq 0)
+  $doCounters=(($i % $CountersSampleEvery) -eq 0)
+
+  $lqi_in=$null; $lqi_out=$null; $age=$null
+  if($doParent){
+    $pTxt=Send-OT "ot parent"
+    $pf=Parse-Parent $pTxt
+    if($pf.rloc16 -and $pf.rloc16 -ne $currentRloc16){
+      Log-Line "Parent RLOC16 changed: $currentRloc16 -> $pf.rloc16"
+      $currentRloc16=$pf.rloc16
+      $mlPrefix=Get-MeshLocalPrefix
+      $currentRlocIPv6=Build-ParentRlocIPv6 $mlPrefix $currentRloc16
+      Log-Line "New parent IPv6: " + (Nz $currentRlocIPv6 "n/a")
+    }
+    $lqi_in=$pf.lqi_in; $lqi_out=$pf.lqi_out; $age=$pf.age
+  }
+
+  $txTotal=$null; $rxTotal=$null; $txErrCca=$null; $txRetry=$null; $rxErrFcs=$null
+  if($doCounters){
+    $cTxt=Send-OT "ot counters mac"
+    $txTotal = Get-Counter $cTxt "TxTotal"
+    $rxTotal = Get-Counter $cTxt "RxTotal"
+    $txErrCca = Get-Counter $cTxt "TxErrCca"
+    $txRetry = Get-Counter $cTxt "TxRetry"
+    $rxErrFcs = Get-Counter $cTxt "RxErrFcs"
+  }
+
+  $pingMs=$null
+  if($currentRlocIPv6){
+    $pong=Send-OT ("ot ping {0}" -f $currentRlocIPv6) 3000
+    if($pong -match '(?mi)\btime=(\d+)ms\b'){ $pingMs=[int]$Matches[1] }
+  } else {
+    Log-Line "No parent IPv6 available yet; skipping ping this tick."
+    if(-not $mlPrefix){ $mlPrefix=Get-MeshLocalPrefix }
+    if(-not $currentRloc16){ $tmpTxt=Send-OT "ot parent"; $tmpPf=Parse-Parent $tmpTxt; $currentRloc16=$tmpPf.rloc16 }
+    $currentRlocIPv6=Build-ParentRlocIPv6 $mlPrefix $currentRloc16
+  }
+
+  $state=Get-State
+
+  $csvLine = ('{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12}' -f `
+    (Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"), `
+    $state, `
+    (Nz $currentRloc16 ""), `
+    (Nz $currentRlocIPv6 ""), `
+    (Nz $lqi_in ""), `
+    (Nz $lqi_out ""), `
+    (Nz $age ""), `
+    (Nz $pingMs ""), `
+    (Nz $txTotal ""), `
+    (Nz $rxTotal ""), `
+    (Nz $txErrCca ""), `
+    (Nz $txRetry ""), `
+    (Nz $rxErrFcs ""))
+  $csvLine | Out-File -FilePath $LogCsv -Append -Encoding utf8
+
+  Start-Sleep -Milliseconds $IntervalMs
+}
+
+# ================== CLEANUP ==================
+"==== Telemetry end $(Get-Date) ====" | Tee-Object -FilePath $LogTxt -Append | Out-Null
+$sp.Close(); $sp.Dispose()
+"Saved logs:`n - $LogTxt`n - $LogCsv"
