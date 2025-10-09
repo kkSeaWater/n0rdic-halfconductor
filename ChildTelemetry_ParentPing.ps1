@@ -1,4 +1,4 @@
-﻿# ChildTelemetry_ParentPing.ps1
+﻿# ChildTelemetry_ParentPing.ps1 (Windows PowerShell 5.1 compatible)
 # Logs OpenThread child state + pings parent each tick. Saves TXT and CSV.
 
 param(
@@ -6,8 +6,9 @@ param(
   [int]$Baud = 115200,
   [int]$IntervalMs = 1000,
   [int]$DurationSec = 300,
+  [int]$WarmupSec = 2,        # wait after thread start before first tick
   [switch]$ForceChild,        # --ForceChild to disable router eligibility
-  [switch]$ResetCounters      # --ResetCounters to clear MAC counters once at start
+  [switch]$ResetCounters      # --ResetCounters to clear MAC counters at start
 )
 
 # ---------- Setup output ----------
@@ -20,8 +21,7 @@ $AnsiRx = '\x1b\[[0-9;]*m'
 # ---------- CSV header ----------
 $CsvHeader = @(
   'timestamp','state','parent_rloc16','parent_ipv6','lqi_in','lqi_out','age_s',
-  'tx_total','rx_total','tx_err_cca','tx_retry','rx_err_fcs',
-  'rtt_ms','note'
+  'tx_total','rx_total','tx_err_cca','tx_retry','rx_err_fcs','rtt_ms','note'
 ) -join ','
 
 # ---------- Serial helpers ----------
@@ -58,12 +58,14 @@ function OT([string]$cmd,[int]$timeoutMs=3000){
 
 # ---------- Small parsers ----------
 function Get-State {
-  (OT 'ot state') | ForEach-Object { if ($_ -notin 'Done'){ $_ } } | Select-Object -First 1
+  (OT 'ot state') |
+    Where-Object { $_ -match '^(disabled|detached|child|router|leader)$' } |
+    Select-Object -First 1
 }
 
 function Get-ParentRloc16Hex {
   $p = (OT 'ot parent')
-  $rl = ($p | Where-Object { $_ -match 'Rloc16:\s*([0-9a-fA-F]{1,4})' } | ForEach-Object { $Matches[1] }) | Select-Object -First 1
+  $rl = ($p | Where-Object { $_ -match '(Rloc|Rloc16):\s*([0-9a-fA-F]{1,4})' } | ForEach-Object { $Matches[2] }) | Select-Object -First 1
   if (-not $rl){ return $null }
   # Zero-pad to 4 hex
   return ('{0:x4}' -f [int]("0x$rl"))
@@ -87,20 +89,20 @@ function Build-ParentIPv6([string]$parentRloc16){
 function Get-Counters {
   $c = (OT 'ot counters mac')
   @{
-    tx_total   = ($c | ?{$_ -match '^TxTotal:\s+(\d+)'} | %{$matches[1]}) | Select -First 1
-    rx_total   = ($c | ?{$_ -match '^RxTotal:\s+(\d+)'} | %{$matches[1]}) | Select -First 1
-    tx_err_cca = ($c | ?{$_ -match '^TxErrCca:\s+(\d+)'} | %{$matches[1]}) | Select -First 1
-    tx_retry   = ($c | ?{$_ -match '^TxRetry:\s+(\d+)'} | %{$matches[1]}) | Select -First 1
-    rx_err_fcs = ($c | ?{$_ -match '^RxErrFcs:\s+(\d+)'} | %{$matches[1]}) | Select -First 1
+    tx_total   = ($c | ?{$_ -match '^TxTotal:\s+(\d+)'} | %{$matches[1]} | Select -First 1)
+    rx_total   = ($c | ?{$_ -match '^RxTotal:\s+(\d+)'} | %{$matches[1]} | Select -First 1)
+    tx_err_cca = ($c | ?{$_ -match '^TxErrCca:\s+(\d+)'} | %{$matches[1]} | Select -First 1)
+    tx_retry   = ($c | ?{$_ -match '^TxRetry:\s+(\d+)'} | %{$matches[1]} | Select -First 1)
+    rx_err_fcs = ($c | ?{$_ -match '^RxErrFcs:\s+(\d+)'} | %{$matches[1]} | Select -First 1)
   }
 }
 
 function Get-ParentInfo {
   $p = (OT 'ot parent')
   @{
-    lqi_in  = ($p | ?{$_ -match 'LinkQualityIn:\s*(\d+)'}  | %{$matches[1]} | Select -First 1)
-    lqi_out = ($p | ?{$_ -match 'LinkQualityOut:\s*(\d+)'} | %{$matches[1]} | Select -First 1)
-    age_s   = ($p | ?{$_ -match '^Age:\s*(\d+)'}           | %{$matches[1]} | Select -First 1)
+    lqi_in  = ($p | ?{$_ -match 'Link\s*Quality\s*In:\s*(\d+)'}  | %{$matches[1]} | Select -First 1)
+    lqi_out = ($p | ?{$_ -match 'Link\s*Quality\s*Out:\s*(\d+)'} | %{$matches[1]} | Select -First 1)
+    age_s   = ($p | ?{$_ -match '^Age:\s*(\d+)'}                 | %{$matches[1]} | Select -First 1)
   }
 }
 
@@ -121,47 +123,44 @@ try {
   # Clean start
   OT 'ot thread stop' | Out-Null
   OT 'ot ifconfig up' | Out-Null
-
   if ($ForceChild){ OT 'ot routereligible disable' | Out-Null }
   if ($ResetCounters){ OT 'ot counters mac reset' | Out-Null }
-
   OT 'ot thread start' | Out-Null
 
-  $t0 = Get-Date
+  if ($WarmupSec -gt 0) { Start-Sleep -Seconds $WarmupSec }
+
   $ticks = [math]::Ceiling($DurationSec*1000.0 / $IntervalMs)
 
   for ($i=0; $i -lt $ticks; $i++){
     $ts = Get-Date
     $state = Get-State
-
     $parentRloc16 = Get-ParentRloc16Hex
     $parentIPv6 = if ($parentRloc16){ Build-ParentIPv6 $parentRloc16 } else { $null }
-
     $pinfo = Get-ParentInfo
     $c     = Get-Counters
     $rtt   = Ping $parentIPv6
-
+    $rttStr = if ($null -ne $rtt) { [string]$rtt } else { '' }
     $note  = if (-not $parentIPv6) { "no_parent_ipv6" } else { "" }
 
     # TXT line
     $lineTxt = "[{0}] state={1} parent_rloc16={2} parent_ipv6={3} lqi_in={4} lqi_out={5} age={6}s tx={7} rx={8} cca={9} retry={10} fcs={11} rtt_ms={12} {13}" -f `
       ($ts.ToString("HH:mm:ss.fff")),$state,$parentRloc16,$parentIPv6,$pinfo.lqi_in,$pinfo.lqi_out,$pinfo.age_s,`
-      $c.tx_total,$c.rx_total,$c.tx_err_cca,$c.tx_retry,$c.rx_err_fcs,`
-      ($rtt ?? ''),$note
+      $c.tx_total,$c.rx_total,$c.tx_err_cca,$c.tx_retry,$c.rx_err_fcs,$rttStr,$note
     $lineTxt | Out-File $LogTxt -Append -Encoding UTF8
 
     # CSV line
     $csv = @(
       $ts.ToString("o"), $state, $parentRloc16, $parentIPv6, $pinfo.lqi_in, $pinfo.lqi_out, $pinfo.age_s,
-      $c.tx_total, $c.rx_total, $c.tx_err_cca, $c.tx_retry, $c.rx_err_fcs,
-      ($rtt ?? ''), $note
+      $c.tx_total, $c.rx_total, $c.tx_err_cca, $c.tx_retry, $c.rx_err_fcs, $rttStr, $note
     ) -join ','
     $csv | Out-File $LogCsv -Append -Encoding UTF8
 
     Start-Sleep -Milliseconds $IntervalMs
   }
-
-} finally {
+}
+finally {
   try { if ($sp){ if ($sp.IsOpen){ $sp.Close() }; $sp.Dispose() } } catch {}
-  "Logs saved:`n  TXT: $LogTxt`n  CSV: $LogCsv" | Tee-Object -FilePath $LogTxt -Append
+  $footer = "Logs saved:`n  TXT: $LogTxt`n  CSV: $LogCsv"
+  $footer | Out-File $LogTxt -Append -Encoding UTF8
+  Write-Host $footer
 }
