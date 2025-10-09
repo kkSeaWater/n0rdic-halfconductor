@@ -1,0 +1,1 @@
+- logger is tied 1:1 to openthread's internal state machine
