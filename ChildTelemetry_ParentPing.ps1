@@ -12,6 +12,16 @@ param(
   [switch]$ResetCounters      # --ResetCounters to clear MAC counters at start
 )
 
+# --- Default values if none provided ---
+if (-not $Port)         { $Port = "COM8" }
+if (-not $Baud)         { $Baud = 115200 }
+if (-not $IntervalMs)   { $IntervalMs = 1000 }
+if (-not $DurationSec)  { $DurationSec = 300 }
+if (-not $WarmupSec)    { $WarmupSec = 2 }
+if (-not $ForceChild)   { $ForceChild = $true }
+if (-not $ResetCounters){ $ResetCounters = $true }
+
+
 # ---------- Setup output ----------
 $stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
 $Base   = (Get-Location).Path
