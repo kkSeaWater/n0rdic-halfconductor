@@ -1,5 +1,6 @@
 ﻿# ChildTelemetry_ParentPing.ps1 (Windows PowerShell 5.1 compatible)
 # Logs OpenThread child state + pings parent each tick. Saves TXT and CSV.
+# Adds event flags: parent_switch, detached_start, reattached, parent_unreachable, state_blank.
 
 param(
   [string]$Port = "COM8",
@@ -20,7 +21,7 @@ $AnsiRx = '\x1b\[[0-9;]*m'
 
 # ---------- CSV header ----------
 $CsvHeader = @(
-  'timestamp','state','parent_rloc16','parent_ipv6','lqi_in','lqi_out','age_s',
+  'timestamp','state','event','parent_rloc16','parent_ipv6','lqi_in','lqi_out','age_s',
   'tx_total','rx_total','tx_err_cca','tx_retry','rx_err_fcs','rtt_ms','note'
 ) -join ','
 
@@ -117,6 +118,10 @@ function Ping([string]$addr,[int]$timeoutMs=1500){
 "# Child Telemetry started $stamp" | Out-File $LogTxt -Encoding UTF8
 $CsvHeader | Out-File $LogCsv -Encoding UTF8
 
+# Track previous values to detect events
+$prevState = $null
+$prevParentRloc16 = $null
+
 try {
   Open-Serial -Port $Port -Baud $Baud
 
@@ -133,27 +138,51 @@ try {
 
   for ($i=0; $i -lt $ticks; $i++){
     $ts = Get-Date
+
     $state = Get-State
+    if (-not $state) { $state = '' }
+
     $parentRloc16 = Get-ParentRloc16Hex
     $parentIPv6 = if ($parentRloc16){ Build-ParentIPv6 $parentRloc16 } else { $null }
+
     $pinfo = Get-ParentInfo
     $c     = Get-Counters
     $rtt   = Ping $parentIPv6
     $rttStr = if ($null -ne $rtt) { [string]$rtt } else { '' }
+
+    # --- Event detection ---
+    $events = @()
+    if (-not $state) { $events += 'state_blank' }
+
+    if ($prevState -ne 'detached' -and $state -eq 'detached') { $events += 'detached_start' }
+    if ($prevState -eq 'detached' -and $state -eq 'child')    { $events += 'reattached' }
+
+    if ($prevParentRloc16 -and $parentRloc16 -and ($prevParentRloc16 -ne $parentRloc16) -and $state -eq 'child') {
+      $events += 'parent_switch'
+    }
+
+    if (-not $parentIPv6) { $events += 'parent_unreachable' }
+
+    $event = ($events -join '|')
+
     $note  = if (-not $parentIPv6) { "no_parent_ipv6" } else { "" }
 
     # TXT line
-    $lineTxt = "[{0}] state={1} parent_rloc16={2} parent_ipv6={3} lqi_in={4} lqi_out={5} age={6}s tx={7} rx={8} cca={9} retry={10} fcs={11} rtt_ms={12} {13}" -f `
-      ($ts.ToString("HH:mm:ss.fff")),$state,$parentRloc16,$parentIPv6,$pinfo.lqi_in,$pinfo.lqi_out,$pinfo.age_s,`
+    $lineTxt = "[{0}] state={1} event={2} parent_rloc16={3} parent_ipv6={4} lqi_in={5} lqi_out={6} age={7}s tx={8} rx={9} cca={10} retry={11} fcs={12} rtt_ms={13} {14}" -f `
+      ($ts.ToString("HH:mm:ss.fff")),$state,$event,$parentRloc16,$parentIPv6,$pinfo.lqi_in,$pinfo.lqi_out,$pinfo.age_s,`
       $c.tx_total,$c.rx_total,$c.tx_err_cca,$c.tx_retry,$c.rx_err_fcs,$rttStr,$note
     $lineTxt | Out-File $LogTxt -Append -Encoding UTF8
 
     # CSV line
     $csv = @(
-      $ts.ToString("o"), $state, $parentRloc16, $parentIPv6, $pinfo.lqi_in, $pinfo.lqi_out, $pinfo.age_s,
+      $ts.ToString("o"), $state, $event, $parentRloc16, $parentIPv6, $pinfo.lqi_in, $pinfo.lqi_out, $pinfo.age_s,
       $c.tx_total, $c.rx_total, $c.tx_err_cca, $c.tx_retry, $c.rx_err_fcs, $rttStr, $note
     ) -join ','
     $csv | Out-File $LogCsv -Append -Encoding UTF8
+
+    # update prevs
+    $prevState = $state
+    $prevParentRloc16 = $parentRloc16
 
     Start-Sleep -Milliseconds $IntervalMs
   }
