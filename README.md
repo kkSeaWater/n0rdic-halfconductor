@@ -1,1 +1,2 @@
 - logger is tied 1:1 to openthread's internal state machine
+- in order to use the power profiler kit II with the DK, cut the SB40 bridge on the DK, then power the DK using the PPKII on Ammeter mode
