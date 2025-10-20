@@ -1,8 +1,4 @@
-﻿# ChildTelemetry_ParentPing.ps1 (Windows PowerShell 5.1 compatible)
-# Logs OpenThread child state + pings parent each tick. Saves TXT and CSV.
-# Adds event flags: parent_switch, detached_start, reattached, parent_unreachable, state_blank.
-
-param(
+﻿param(
   [string]$Port = "COM8",
   [int]$Baud = 115200,
   [int]$IntervalMs = 1000,
