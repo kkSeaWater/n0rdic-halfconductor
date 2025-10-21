@@ -1,7 +1,7 @@
 <#
 ChildTelemetry_Risk.ps1
 PowerShell 5.1-compatible
-- Logs OT telemetry to Desktop\risk_logs_*.txt and risk_telemetry_*.csv
+- Logs OT telemetry to risk_logs_*.txt and risk_telemetry_*.csv in the current directory
 - Predicts link degradation (LQI / RTT rolling stats)
 - Triggers proactive reattach: thread stop → ifconfig up → thread start
 #>
@@ -16,17 +16,17 @@ $UseOtPrefix      = $true
 $ResetCounters    = $true
 $ForceChild       = $true
 
-# Predictive thresholds - adjusted for OpenThread LQI range 0-3 (3=best)
-$LqiFloor         = 2      # Risk if mean < 2
-$LqiJitterMin     = 0.5    # Risk if std dev > 0.5
-$RttCeilMs        = 70
-$DwellSec         = 3
-$CooldownSec      = 60
+# Predictive thresholds - for OpenThread LQI 0-3 (3=best)
+$LqiFloor         = 2     # Risk if mean < 2
+$LqiJitterMin     = 0.5    # Risk if std > 0.5
+$RttCeilMs        = 15     # Lowered to 20 for testing, since seen means ~12-23
+$DwellSec         = 0.1
+$CooldownSec      = 30
 $AttachTimeoutSec = 10
 # ==================================================
 
 $stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$Base   = Join-Path $env:USERPROFILE "Desktop"
+$Base   = (Get-Location).Path
 $LogTxt = Join-Path $Base "risk_logs_$stamp.txt"
 $LogCsv = Join-Path $Base "risk_telemetry_$stamp.csv"
 
