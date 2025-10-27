@@ -8,6 +8,7 @@ import warnings
 import io
 from pathlib import Path
 import re
+import numpy as np  # For pie chart calculations if needed
 
 # ---------- Helpers ----------
 def load_csv(path):
@@ -78,6 +79,8 @@ def find_matching_txt(csv_path):
     candidate_names = [
         f"risk_logs_{dt_part}.txt",
         f"risk_logs_{parts[-1]}.txt",
+        f"child_log_{dt_part}.txt",
+        f"child_log_{parts[-1]}.txt",
     ]
     for name in candidate_names:
         txt_path = Path(csv_path).parent / name
@@ -93,11 +96,11 @@ def parse_switch_durations(txt_path):
     switches = []
     for line in lines:
         match = re.search(
-            r'\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+event=predictive_switch\s+ok=(True|False)\s+elapsed=([\d\.]+)s', line)
+            r'\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+event=(predictive_switch|parent_switch)\s+ok=(True|False)\s+elapsed=([\d\.]+)s', line)
         if match:
             time_str = match.group(1)
-            ok = match.group(2) == 'True'
-            elapsed = float(match.group(3))
+            ok = match.group(3) == 'True'
+            elapsed = float(match.group(4))
             try:
                 date_str = Path(txt_path).stem.split('_')[-2]
                 datetime_str = f"{date_str} {time_str}"
@@ -201,7 +204,7 @@ def zoom_to_switch(df, switches, window_sec=30):
     end = switch_time + timedelta(seconds=window_sec)
     return df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
 
-# ---------- NEW: Attachment Pie ----------
+# ---------- Attachment Pie ----------
 def compute_attachment_durations(df, switches=None):
     if df.empty or "timestamp" not in df.columns:
         return {}
@@ -238,8 +241,14 @@ def plot_attachment_pie(durations, csv_path):
         return None
     labels = list(durations.keys())
     values = [durations[k] for k in labels]
+    
+    def autopct_func(pct):
+        total = sum(values)
+        absolute = (pct / 100.) * total
+        return "{:.1f}%\n({:.2f}s)".format(pct, absolute)
+    
     fig, ax = plt.subplots(figsize=(7, 7))
-    ax.pie(values, labels=labels, autopct=lambda p: f"{p:.1f}%")
+    ax.pie(values, labels=labels, autopct=autopct_func)
     ax.set_title("Attachment Time Distribution")
     savefig(fig, csv_path, "attachment_pie")
     return fig
@@ -283,7 +292,7 @@ def select_file(files, file_type):
 
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Analyze OpenThread telemetry CSV with risk metrics.")
     parser.add_argument("--folder", type=str, default=r"C:\Users\adire\Desktop\nordic_logs",
                         help="Folder with telemetry CSV")
     args = parser.parse_args()
@@ -291,10 +300,11 @@ def main():
     folder = Path(args.folder)
     telemetry_glob1 = glob.glob(os.path.join(folder, "correlated_risk_telemetry_*.csv"))
     telemetry_glob2 = glob.glob(os.path.join(folder, "risk_telemetry_*.csv"))
-    telemetry_files = [Path(f) for f in set(telemetry_glob1 + telemetry_glob2)]
+    telemetry_glob3 = glob.glob(os.path.join(folder, "*telemetry_*.csv"))
+    telemetry_files = [Path(f) for f in set(telemetry_glob1 + telemetry_glob2 + telemetry_glob3)]
     
     if not telemetry_files:
-        raise FileNotFoundError(f"No (correlated_) risk telemetry CSV found in {folder}")
+        raise FileNotFoundError(f"No telemetry CSV found in {folder}")
 
     telemetry_files.sort(key=extract_timestamp)
 
@@ -309,7 +319,6 @@ def main():
     t = df["timestamp"]
     has_power = "avg_current_uA" in df.columns and df["avg_current_uA"].notna().any()
 
-    # Integrated plots from analyse_telemetry
     # 1) RTT over time
     if "rtt_ms" in df.columns and df["rtt_ms"].notna().any():
         fig1, ax = plt.subplots(figsize=(12, 6))
@@ -446,7 +455,6 @@ def main():
         ax3.set_xlabel("Timestamp")
         ax3.set_ylabel("Current (μA)", color="tab:red")
         ax3.tick_params(axis='y', labelcolor="tab:red")
-        i_min, i_max = df["avg_current_uA"].min(), df["avg_current_uA"].max()
         ax3.set_ylim(i_min - 50, i_max + 50)
         
         ax4 = ax3.twinx()
@@ -457,7 +465,7 @@ def main():
         fig7.legend(loc="upper right")
         savefig(fig7, csv_path, "transmission_power_with_parents")
 
-    # Original risk metrics features
+    # Attachment pie and summary
     durations = compute_attachment_durations(df, switches)
     total_s = sum(durations.values())
     if total_s > 0:
@@ -471,7 +479,7 @@ def main():
     else:
         print("No timing information to build attachment pie.")
 
-    # Integrated summary from analyse_telemetry
+    # Summary
     print("\n--- Summary ---")
     valid_rtt = df["rtt_ms"].dropna()
     if len(valid_rtt):

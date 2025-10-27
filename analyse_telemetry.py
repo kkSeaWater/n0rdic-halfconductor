@@ -1,4 +1,3 @@
-
 import os
 import glob
 import argparse
@@ -7,14 +6,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import warnings
 import io
+from pathlib import Path
+import re
+import numpy as np  # Added for pie chart calculations
 
 # ---------- Helpers ----------
-def find_latest_csv(folder):
-    files = glob.glob(os.path.join(folder, "*telemetry_*.csv"))  # Catch both child_ and correlated_
-    if not files:
-        raise FileNotFoundError(f"No telemetry CSV found in {folder}")
-    return max(files, key=os.path.getmtime)
-
 def load_csv(path):
     # Read lines manually to skip summary section
     with open(path, 'r') as f:
@@ -109,136 +105,266 @@ def savefig(fig, csv_path, suffix):
     fig.savefig(out, dpi=140, bbox_inches="tight")
     print(f"Saved: {out}")
 
+# Extract timestamp from filename
+def extract_timestamp(filename):
+    try:
+        # Try to find date-time pattern in filename like YYYYMMDD_HHMMSS or similar
+        parts = filename.stem.split('_')
+        for part in parts:
+            if len(part) == 8 and part.isdigit():  # YYYYMMDD
+                next_part = parts[parts.index(part) + 1] if parts.index(part) + 1 < len(parts) else ''
+                if len(next_part) == 6 and next_part.isdigit():  # HHMMSS
+                    ts_str = f"{part}_{next_part}"
+                    return datetime.strptime(ts_str, '%Y%m%d_%H%M%S')
+        # Alternative pattern like 20251023T093856
+        for part in filename.stem.split('-'):
+            if 'T' in part:
+                ts_str = part.replace('T', '_').split('_')[0] + '_' + part.split('T')[1]
+                return datetime.strptime(ts_str, '%Y%m%d_%H%M%S')
+        raise ValueError
+    except (ValueError, IndexError):
+        return datetime.fromtimestamp(filename.stat().st_mtime)
+
+# Function to select file interactively
+def select_file(files, file_type):
+    print(f"Available {file_type} files:")
+    for i, file in enumerate(files, 1):
+        ts = extract_timestamp(file)
+        print(f"{i}: {file.name} (timestamp: {ts})")
+    
+    while True:
+        try:
+            choice = int(input(f"Enter the number of the {file_type} file to use: "))
+            if 1 <= choice <= len(files):
+                return files[choice - 1]
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {len(files)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+# ---------- Attachment Pie Functions ----------
+def find_matching_txt(csv_path):
+    stem = Path(csv_path).stem
+    parts = stem.split('_')
+    if len(parts) >= 3:
+        dt_part = '_'.join(parts[-2:])
+    else:
+        dt_part = parts[-1]
+    candidate_names = [
+        f"risk_logs_{dt_part}.txt",
+        f"risk_logs_{parts[-1]}.txt",
+        f"child_log_{dt_part}.txt",
+        f"child_log_{parts[-1]}.txt",
+    ]
+    for name in candidate_names:
+        txt_path = Path(csv_path).parent / name
+        if txt_path.exists():
+            return txt_path
+    return None
+
+def parse_switch_durations(txt_path):
+    if not txt_path:
+        return []
+    with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    switches = []
+    for line in lines:
+        match = re.search(
+            r'\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+event=(predictive_switch|parent_switch)\s+ok=(True|False)\s+elapsed=([\d\.]+)s', line)
+        if match:
+            time_str = match.group(1)
+            ok = match.group(3) == 'True'
+            elapsed = float(match.group(4))
+            try:
+                date_str = Path(txt_path).stem.split('_')[-2]
+                datetime_str = f"{date_str} {time_str}"
+                switch_time = datetime.strptime(datetime_str, '%Y%m%d %H:%M:%S.%f')
+            except Exception:
+                today = datetime.now().strftime('%Y%m%d')
+                switch_time = datetime.strptime(f"{today} {time_str}", '%Y%m%d %H:%M:%S.%f')
+            switches.append((switch_time, elapsed, ok))
+    return switches
+
+def compute_attachment_durations(df, switches=None):
+    if df.empty or "timestamp" not in df.columns:
+        return {}
+
+    if "state" not in df.columns:
+        df["state"] = ""
+    if "parent_rloc16" not in df.columns:
+        df["parent_rloc16"] = "none"
+
+    df = df.copy()
+    df["t_next"] = df["timestamp"].shift(-1)
+    df["dt"] = (df["t_next"] - df["timestamp"]).dt.total_seconds()
+    df = df[df["dt"] > 0]
+
+    def label_row(row):
+        st = str(row.get("state", "")).lower()
+        parent = str(row.get("parent_rloc16", "none"))
+        if st == "detached" or parent == "none" or parent.strip() == "":
+            return "Switching"
+        return f"Parent {parent}"
+
+    df["label"] = df.apply(label_row, axis=1)
+    durations = df.groupby("label")["dt"].sum().to_dict()
+
+    if switches:
+        txt_switch_total = sum(elapsed for (_, elapsed, _) in switches)
+        durations["Switching"] = durations.get("Switching", 0.0) + txt_switch_total  # Add to existing detached time
+
+    return durations
+
+def plot_attachment_pie(durations, csv_path):
+    if not durations:
+        print("No durations to plot for attachment pie.")
+        return None
+    labels = list(durations.keys())
+    values = [durations[k] for k in labels]
+    
+    def autopct_func(pct):
+        total = sum(values)
+        absolute = (pct / 100.) * total
+        return "{:.1f}%\n({:.2f}s)".format(pct, absolute)
+    
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.pie(values, labels=labels, autopct=autopct_func)
+    ax.set_title("Attachment Time Distribution")
+    savefig(fig, csv_path, "attachment_pie")
+    return fig
+
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser(description="Analyze OpenThread telemetry CSV.")
     parser.add_argument("--folder", default=r"C:\Users\adire\Desktop\nordic_logs", help="Directory containing telemetry CSVs")
     args = parser.parse_args()
     
-    csv_path = find_latest_csv(args.folder)
-    print(f"\nUsing telemetry file: {csv_path}\n")
+    folder = Path(args.folder)
+    telemetry_files = [f for f in folder.glob('*telemetry_*.csv')]
+    
+    if not telemetry_files:
+        raise FileNotFoundError(f"No telemetry CSV found in {folder}")
+    
+    telemetry_files.sort(key=extract_timestamp)
+    
+    selected_telemetry = select_file(telemetry_files, "telemetry")
+    csv_path = str(selected_telemetry)
+    print(f"Analyzing: {csv_path}")
+    
+    txt_path = find_matching_txt(csv_path)
+    switches = parse_switch_durations(txt_path)
+    
     df = load_csv(csv_path)
-    df["parent_rloc16"] = df["parent_rloc16"].fillna("none")  # Fill for detached/none
-    df.loc[df['state'] != 'child', 'parent_rloc16'] = 'none'  # Set to none when not in child state
     t = df["timestamp"]
+    has_power = "avg_current_uA" in df.columns and df["avg_current_uA"].notna().any()
     
-    has_power = "avg_current_uA" in df.columns
-    
-    # Helper to create plot with common elements
-    def create_plot(title, ylabel):
-        fig, ax = plt.subplots()
+    # 1) RTT over time
+    if "rtt_ms" in df.columns and df["rtt_ms"].notna().any():
+        fig1, ax = plt.subplots(figsize=(12, 6))
         mark_detached(ax, df)
         add_event_markers(ax, df)
-        ax.set_title(title)
+        ax.plot(t, df["rtt_ms"], label="RTT (ms)")
+        ax.set_title("RTT over Time")
         ax.set_xlabel("Timestamp")
-        ax.set_ylabel(ylabel)
+        ax.set_ylabel("RTT (ms)")
+        ax.legend()
         ax.tick_params(axis='x', rotation=45)
-        ax.grid(True, linestyle='--', alpha=0.5)
-        return fig, ax
-    
-    # 1) RTT
-    if df["rtt_ms"].notna().any():
-        fig1, ax1 = create_plot("RTT over time", "RTT (ms)")
-        ax1.plot(t, df["rtt_ms"], color="tab:blue", label="RTT (ms)")
-        # Add moving average for smoother trend
-        if len(df) > 5:
-            ma = df["rtt_ms"].rolling(window=5).mean()
-            ax1.plot(t, ma, color="tab:orange", label="5-pt MA")
-        ax1.legend()
+        ax.grid(True)
         savefig(fig1, csv_path, "rtt")
-    else:
-        warnings.warn("Skipping RTT plot: No valid data.")
     
-    # 2) LQI
-    if df["lqi_in"].notna().any() or df["lqi_out"].notna().any():
-        fig2, ax2 = create_plot("LQI over time", "LQI")
-        if "lqi_in" in df: ax2.plot(t, df["lqi_in"], label="LQI in", color="tab:orange")
-        if "lqi_out" in df: ax2.plot(t, df["lqi_out"], label="LQI out", color="tab:green")
-        ax2.legend()
+    # 2) LQI In/Out
+    if all(col in df for col in ["lqi_in", "lqi_out"]):
+        fig2, ax = plt.subplots(figsize=(12, 6))
+        mark_detached(ax, df)
+        add_event_markers(ax, df)
+        ax.plot(t, df["lqi_in"], label="LQI In")
+        ax.plot(t, df["lqi_out"], label="LQI Out")
+        ax.set_title("LQI In/Out over Time")
+        ax.set_xlabel("Timestamp")
+        ax.set_ylabel("LQI")
+        ax.legend()
+        ax.tick_params(axis='x', rotation=45)
+        ax.grid(True)
         savefig(fig2, csv_path, "lqi")
-    else:
-        warnings.warn("Skipping LQI plot: No valid data.")
     
-    # 3) MAC deltas
-    def delta(col):
-        return df[col].diff().fillna(0) if col in df else None
+    # 3) Age
+    if "age_s" in df.columns:
+        fig3, ax = plt.subplots(figsize=(12, 6))
+        mark_detached(ax, df)
+        add_event_markers(ax, df)
+        ax.plot(t, df["age_s"], label="Age (s)")
+        ax.set_title("Parent Age over Time")
+        ax.set_xlabel("Timestamp")
+        ax.set_ylabel("Age (s)")
+        ax.legend()
+        ax.tick_params(axis='x', rotation=45)
+        ax.grid(True)
+        savefig(fig3, csv_path, "age")
     
-    d_retry = delta("tx_retry")
-    d_cca = delta("tx_err_cca")
-    d_fcs = delta("rx_err_fcs")
-    if any(d is not None for d in [d_retry, d_cca, d_fcs]):
-        fig3, ax3 = create_plot("MAC error deltas per tick", "Count")
-        if d_retry is not None: ax3.plot(t, d_retry, label="Δ retry")
-        if d_cca is not None: ax3.plot(t, d_cca, label="Δ CCA")
-        if d_fcs is not None: ax3.plot(t, d_fcs, label="Δ FCS")
-        ax3.legend()
-        savefig(fig3, csv_path, "mac_deltas")
-    else:
-        warnings.warn("Skipping MAC deltas plot: No valid data.")
+    # 4) MAC Counters (TX/RX totals, errors)
+    if all(col in df for col in ["tx_total", "rx_total", "tx_err_cca", "tx_retry", "rx_err_fcs"]):
+        fig4, ax1 = plt.subplots(figsize=(12, 6))
+        mark_detached(ax1, df)
+        add_event_markers(ax1, df)
+        ax1.plot(t, df["tx_total"], label="TX Total")
+        ax1.plot(t, df["rx_total"], label="RX Total")
+        ax1.set_ylabel("Packets")
+        ax1.legend(loc="upper left")
+        
+        ax2 = ax1.twinx()
+        ax2.plot(t, df["tx_err_cca"], color="orange", label="TX Err CCA")
+        ax2.plot(t, df["tx_retry"], color="purple", label="TX Retry")
+        ax2.plot(t, df["rx_err_fcs"], color="brown", label="RX Err FCS")
+        ax2.set_ylabel("Errors")
+        ax2.legend(loc="upper right")
+        
+        ax1.set_title("MAC Counters over Time")
+        ax1.set_xlabel("Timestamp")
+        ax1.tick_params(axis='x', rotation=45)
+        ax1.grid(True)
+        savefig(fig4, csv_path, "mac_counters")
     
-    # 4) State timeline
-    state_map = {"disabled": 0, "detached": 1, "child": 2, "router": 3, "leader": 4, "": -1}
-    y = df["state"].map(lambda s: state_map.get(str(s).lower(), -1))
-    fig4, ax4 = create_plot("Node state timeline", "State")
-    ax4.step(t, y, where="post", color="tab:purple")
-    ax4.set_yticks(list(state_map.values()))
-    ax4.set_yticklabels(list(state_map.keys()))
-    savefig(fig4, csv_path, "state")
-    
-    # 4.5) Parent timeline (new graph)
-    if "parent_rloc16" in df.columns and df["parent_rloc16"].notna().any():
-        unique_parents = sorted(df["parent_rloc16"].unique())
-        parent_map = {p: i for i, p in enumerate(unique_parents)}
-        y_parent = df["parent_rloc16"].map(parent_map)
-        fig_parent, ax_parent = create_plot("Parent Attachment over Time", "Parent RLOC16")
-        ax_parent.step(t, y_parent, where="post", color="tab:orange", linewidth=2)
-        ax_parent.set_yticks(list(parent_map.values()))
-        ax_parent.set_yticklabels(list(parent_map.keys()))
-        # Annotate changes
-        changes = df["parent_rloc16"].ne(df["parent_rloc16"].shift()).index[df["parent_rloc16"].ne(df["parent_rloc16"].shift())]
-        for idx in changes:
-            if idx > 0:
-                ax_parent.annotate(df.loc[idx, "parent_rloc16"], (t[idx], y_parent[idx]), xytext=(5, 5), textcoords='offset points', fontsize=8)
-        savefig(fig_parent, csv_path, "parent")
-    else:
-        warnings.warn("Skipping parent plot: No valid data.")
-    
-    # 5) Power (if available)
-    if has_power and df["avg_current_uA"].notna().any():
-        fig5, ax5 = create_plot("Average Current over time", "Current (μA)")
-        ax5.plot(t, df["avg_current_uA"], color="tab:red", label="Avg Current (μA)", linewidth=2)
+    # 5) Power (absolute)
+    if has_power:
+        fig5, ax5 = plt.subplots(figsize=(12, 6))
+        mark_detached(ax5, df)
+        add_event_markers(ax5, df)
+        ax5.plot(t, df["avg_current_uA"], color="tab:red", label="Current (μA)", linewidth=2)
         # Tight y-limits to show variations better
         i_min, i_max = df["avg_current_uA"].min(), df["avg_current_uA"].max()
         ax5.set_ylim(i_min - 20, i_max + 20)
+        ax5.set_title("Power over Time")
+        ax5.set_xlabel("Timestamp")
+        ax5.set_ylabel("Current (μA)")
+        ax5.tick_params(axis='x', rotation=45)
+        ax5.grid(True)
         ax5.legend()
         savefig(fig5, csv_path, "power")
     elif has_power:
         warnings.warn("Skipping power plot: No valid data.")
     
-    # 6) Transmission and Power Spikes (original)
+    # 6) Transmission and Power (original, absolute current)
     if has_power and df["avg_current_uA"].notna().any() and all(col in df for col in ["tx_total", "rx_total"]):
         df['tx_delta'] = df['tx_total'].diff().fillna(0)
         df['rx_delta'] = df['rx_total'].diff().fillna(0)
         df['msg_activity'] = df['tx_delta'] + df['rx_delta']
-        df['current_delta'] = df['avg_current_uA'].diff().fillna(0)  # Now using delta for spikes
-        
         fig6, ax1 = plt.subplots(figsize=(12, 6))
         mark_detached(ax1, df)
         add_event_markers(ax1, df)
         ax1.tick_params(axis='x', rotation=45)
         ax1.grid(True, linestyle='--', alpha=0.5)
         
-        # Power delta on left axis for spike visibility (instead of absolute, which is flat)
-        ax1.plot(t, df["current_delta"], color="tab:red", label="Δ Current (μA)", linewidth=2)
-        ax1.set_title("Message Transmission Spikes and Power Spikes")
+        # Absolute current on left axis
+        ax1.plot(t, df["avg_current_uA"], color="tab:red", label="Current (μA)", linewidth=2)
+        ax1.set_title("Message Transmission and Power")
         ax1.set_xlabel("Timestamp")
-        ax1.set_ylabel("Δ Current (μA)", color="tab:red")
+        ax1.set_ylabel("Current (μA)", color="tab:red")
         ax1.tick_params(axis='y', labelcolor="tab:red")
-        # Tight limits
-        d_min, d_max = df["current_delta"].min(), df["current_delta"].max()
-        ax1.set_ylim(d_min - 50, d_max + 50)  # Amplified for visibility
+        # Tight limits around absolute values
+        i_min, i_max = df["avg_current_uA"].min(), df["avg_current_uA"].max()
+        ax1.set_ylim(i_min - 50, i_max + 50)  # Adjust buffer as needed
         
-        # Twin axis for message activity spikes
+        # Twin axis for message activity
         ax2 = ax1.twinx()
         # Compute bar width based on average time delta (in days for matplotlib)
         delta_t_days = (t - t.shift(1)).mean().total_seconds() / 86400 if len(t) > 1 else 0.001
@@ -247,12 +373,16 @@ def main():
         ax2.tick_params(axis='y', labelcolor="tab:blue")
         
         fig6.legend(loc="upper right")
-        savefig(fig6, csv_path, "transmission_power_spikes")
+        savefig(fig6, csv_path, "transmission_power")
     else:
-        warnings.warn("Skipping transmission/power spikes plot: Missing required columns (avg_current_uA, tx_total, rx_total).")
+        warnings.warn("Skipping transmission/power plot: Missing required columns (avg_current_uA, tx_total, rx_total).")
     
-    # 7) Transmission and Power Spikes with Parent Periods (new)
+    # 7) Transmission and Power with Parent Periods (absolute current)
     if has_power and df["avg_current_uA"].notna().any() and all(col in df for col in ["tx_total", "rx_total"]) and "parent_rloc16" in df.columns:
+        df['tx_delta'] = df['tx_total'].diff().fillna(0)
+        df['rx_delta'] = df['rx_total'].diff().fillna(0)
+        df['msg_activity'] = df['tx_delta'] + df['rx_delta']
+        
         fig7, ax3 = plt.subplots(figsize=(12, 6))
         mark_detached(ax3, df)
         add_event_markers(ax3, df)
@@ -260,13 +390,13 @@ def main():
         ax3.tick_params(axis='x', rotation=45)
         ax3.grid(True, linestyle='--', alpha=0.5)
         
-        # Power delta
-        ax3.plot(t, df["current_delta"], color="tab:red", label="Δ Current (μA)", linewidth=2)
-        ax3.set_title("Message Transmission Spikes and Power Spikes with Parent Periods")
+        # Absolute current
+        ax3.plot(t, df["avg_current_uA"], color="tab:red", label="Current (μA)", linewidth=2)
+        ax3.set_title("Message Transmission and Power with Parent Periods")
         ax3.set_xlabel("Timestamp")
-        ax3.set_ylabel("Δ Current (μA)", color="tab:red")
+        ax3.set_ylabel("Current (μA)", color="tab:red")
         ax3.tick_params(axis='y', labelcolor="tab:red")
-        ax3.set_ylim(d_min - 50, d_max + 50)
+        ax3.set_ylim(i_min - 50, i_max + 50)  # Adjust buffer as needed
         
         # Twin axis for message activity
         ax4 = ax3.twinx()
@@ -275,9 +405,23 @@ def main():
         ax4.tick_params(axis='y', labelcolor="tab:blue")
         
         fig7.legend(loc="upper right")
-        savefig(fig7, csv_path, "transmission_power_spikes_with_parents")
+        savefig(fig7, csv_path, "transmission_power_with_parents")
     else:
-        warnings.warn("Skipping transmission/power spikes with parents plot: Missing required columns.")
+        warnings.warn("Skipping transmission/power with parents plot: Missing required columns.")
+    
+    # ---------- Attachment Pie ----------
+    durations = compute_attachment_durations(df, switches)
+    total_s = sum(durations.values())
+    if total_s > 0:
+        print("\n--- Attachment Time Summary ---")
+        for k, v in sorted(durations.items(), key=lambda kv: -kv[1]):
+            pct = 100.0 * v / total_s
+            print(f"{k}: {v:.2f}s ({pct:.1f}%)")
+        switching_s = durations.get("Switching", 0.0)
+        print(f"Total Switching Time: {switching_s:.2f}s ({(switching_s/total_s*100):.1f}%)")
+        plot_attachment_pie(durations, csv_path)
+    else:
+        print("No timing information to build attachment pie.")
     
     # ---------- Summary ----------
     print("\n--- Summary ---")

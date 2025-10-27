@@ -17,9 +17,9 @@ args = parser.parse_args()
 # Directory to scan
 log_dir = Path(args.log_dir)
 
-# Find telemetry and PPK files
-telemetry_files = [f for f in log_dir.glob('tele*.csv')]
-ppk_files = [f for f in log_dir.glob('ppk2*.csv')]
+# Find telemetry and PPK files with updated patterns
+telemetry_files = [f for f in log_dir.glob('*telemetry*.csv')]
+ppk_files = [f for f in log_dir.glob('ppk*.csv')]
 
 if not telemetry_files or not ppk_files:
     print("Could not find telemetry or PPK files.")
@@ -28,33 +28,64 @@ if not telemetry_files or not ppk_files:
 # Extract timestamp from filename
 def extract_timestamp(filename):
     try:
-        ts_str = filename.stem.split('_')[-1]  # Assumes timestamp is last part before .csv
-        return datetime.strptime(ts_str, '%Y%m%d_%H%M%S')
+        # Try to find date-time pattern in filename like YYYYMMDD_HHMMSS or similar
+        parts = filename.stem.split('_')
+        for part in parts:
+            if len(part) == 8 and part.isdigit():  # YYYYMMDD
+                next_part = parts[parts.index(part) + 1] if parts.index(part) + 1 < len(parts) else ''
+                if len(next_part) == 6 and next_part.isdigit():  # HHMMSS
+                    ts_str = f"{part}_{next_part}"
+                    return datetime.strptime(ts_str, '%Y%m%d_%H%M%S')
+        # Alternative pattern like 20251023T093856
+        for part in filename.stem.split('-'):
+            if 'T' in part:
+                ts_str = part.replace('T', '_').split('_')[0] + '_' + part.split('T')[1]
+                return datetime.strptime(ts_str, '%Y%m%d_%H%M%S')
+        raise ValueError
     except (ValueError, IndexError):
         return datetime.fromtimestamp(filename.stat().st_mtime)
 
-# Pair files by closest timestamps
+# Sort files by timestamp
 telemetry_files.sort(key=extract_timestamp)
 ppk_files.sort(key=extract_timestamp)
-latest_telemetry = telemetry_files[-1]
-latest_ppk = ppk_files[-1]
+
+# Function to select file interactively
+def select_file(files, file_type):
+    print(f"Available {file_type} files:")
+    for i, file in enumerate(files, 1):
+        ts = extract_timestamp(file)
+        print(f"{i}: {file.name} (timestamp: {ts})")
+    
+    while True:
+        try:
+            choice = int(input(f"Enter the number of the {file_type} file to use: "))
+            if 1 <= choice <= len(files):
+                return files[choice - 1]
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {len(files)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+# Select telemetry and PPK files
+selected_telemetry = select_file(telemetry_files, "telemetry")
+selected_ppk = select_file(ppk_files, "PPK")
 
 # Check if files are from the same run (within 1 hour)
-tele_ts = extract_timestamp(latest_telemetry)
-ppk_ts = extract_timestamp(latest_ppk)
+tele_ts = extract_timestamp(selected_telemetry)
+ppk_ts = extract_timestamp(selected_ppk)
 if abs((tele_ts - ppk_ts).total_seconds()) > 3600:
     print(f"Warning: Telemetry ({tele_ts}) and PPK ({ppk_ts}) files may not be from the same run.")
 
-print(f"Correlating {latest_telemetry} with {latest_ppk}")
+print(f"Correlating {selected_telemetry} with {selected_ppk}")
 
 # Load Telemetry CSV
-df_telemetry = pd.read_csv(latest_telemetry, encoding='utf-8-sig')
+df_telemetry = pd.read_csv(selected_telemetry, encoding='utf-8-sig')
 df_telemetry['timestamp'] = pd.to_datetime(df_telemetry['timestamp'])
 df_telemetry.set_index('timestamp', inplace=True)
 telemetry_start_time = df_telemetry.index.min()
 
 # Read script start time from corresponding .txt file
-log_txt_path = latest_telemetry.with_suffix('.txt')
+log_txt_path = selected_telemetry.with_suffix('.txt')
 try:
     with open(log_txt_path, 'r', encoding='utf-8') as f:
         first_line = f.readline().strip()
@@ -70,7 +101,7 @@ except FileNotFoundError:
 
 # Load PPK CSV and validate columns
 required_cols = ['Timestamp(ms)', 'Current(uA)']
-df_ppk = pd.read_csv(latest_ppk)
+df_ppk = pd.read_csv(selected_ppk)
 if not all(col in df_ppk.columns for col in required_cols):
     print(f"PPK CSV missing required columns: {required_cols}")
     exit(1)
