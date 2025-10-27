@@ -183,7 +183,9 @@ def mark_switch_durations(ax, switches):
                 horizontalalignment='center', fontsize=9,
                 bbox=dict(facecolor='white', alpha=0.7))
 
-def savefig(fig, csv_path, suffix):
+def savefig(fig, csv_path, suffix, save_plots):
+    if not save_plots:
+        return
     stem = Path(csv_path).stem
     out_path = Path(csv_path).parent / f"{stem}_{suffix}.png"
     fig.savefig(out_path, bbox_inches="tight", dpi=300)
@@ -235,7 +237,7 @@ def compute_attachment_durations(df, switches=None):
 
     return durations
 
-def plot_attachment_pie(durations, csv_path):
+def plot_attachment_pie(durations, csv_path, save_plots):
     if not durations:
         print("No durations to plot for attachment pie.")
         return None
@@ -250,7 +252,7 @@ def plot_attachment_pie(durations, csv_path):
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.pie(values, labels=labels, autopct=autopct_func)
     ax.set_title("Attachment Time Distribution")
-    savefig(fig, csv_path, "attachment_pie")
+    savefig(fig, csv_path, "attachment_pie", save_plots)
     return fig
 
 # Extract timestamp from filename
@@ -290,26 +292,7 @@ def select_file(files, file_type):
         except ValueError:
             print("Invalid input. Please enter a number.")
 
-# ---------- Main ----------
-def main():
-    parser = argparse.ArgumentParser(description="Analyze OpenThread telemetry CSV with risk metrics.")
-    parser.add_argument("--folder", type=str, default=r"C:\Users\adire\Desktop\nordic_logs",
-                        help="Folder with telemetry CSV")
-    args = parser.parse_args()
-
-    folder = Path(args.folder)
-    telemetry_glob1 = glob.glob(os.path.join(folder, "correlated_risk_telemetry_*.csv"))
-    telemetry_glob2 = glob.glob(os.path.join(folder, "risk_telemetry_*.csv"))
-    telemetry_glob3 = glob.glob(os.path.join(folder, "*telemetry_*.csv"))
-    telemetry_files = [Path(f) for f in set(telemetry_glob1 + telemetry_glob2 + telemetry_glob3)]
-    
-    if not telemetry_files:
-        raise FileNotFoundError(f"No telemetry CSV found in {folder}")
-
-    telemetry_files.sort(key=extract_timestamp)
-
-    selected_telemetry = select_file(telemetry_files, "telemetry")
-    csv_path = selected_telemetry
+def analyze_telemetry(csv_path, save_plots):
     print(f"Analyzing: {csv_path}")
     txt_path = find_matching_txt(csv_path)
     switches = parse_switch_durations(txt_path)
@@ -332,7 +315,7 @@ def main():
         ax.legend()
         ax.tick_params(axis='x', rotation=45)
         ax.grid(True)
-        savefig(fig1, csv_path, "rtt")
+        savefig(fig1, csv_path, "rtt", save_plots)
 
     # 2) LQI In/Out
     if all(col in df for col in ["lqi_in", "lqi_out"]):
@@ -348,7 +331,7 @@ def main():
         ax.legend()
         ax.tick_params(axis='x', rotation=45)
         ax.grid(True)
-        savefig(fig2, csv_path, "lqi")
+        savefig(fig2, csv_path, "lqi", save_plots)
 
     # 3) Age
     if "age_s" in df.columns:
@@ -363,7 +346,7 @@ def main():
         ax.legend()
         ax.tick_params(axis='x', rotation=45)
         ax.grid(True)
-        savefig(fig3, csv_path, "age")
+        savefig(fig3, csv_path, "age", save_plots)
 
     # 4) MAC Counters (TX/RX totals, errors)
     if all(col in df for col in ["tx_total", "rx_total", "tx_err_cca", "tx_retry", "rx_err_fcs"]):
@@ -387,7 +370,7 @@ def main():
         ax1.set_xlabel("Timestamp")
         ax1.tick_params(axis='x', rotation=45)
         ax1.grid(True)
-        savefig(fig4, csv_path, "mac_counters")
+        savefig(fig4, csv_path, "mac_counters", save_plots)
 
     # 5) Power (absolute)
     if has_power:
@@ -404,7 +387,7 @@ def main():
         ax5.tick_params(axis='x', rotation=45)
         ax5.grid(True)
         ax5.legend()
-        savefig(fig5, csv_path, "power")
+        savefig(fig5, csv_path, "power", save_plots)
 
     # 6) Transmission and Power (original, absolute current)
     if has_power and df["avg_current_uA"].notna().any() and all(col in df for col in ["tx_total", "rx_total"]):
@@ -434,7 +417,7 @@ def main():
         ax2.tick_params(axis='y', labelcolor="tab:blue")
         
         fig6.legend(loc="upper right")
-        savefig(fig6, csv_path, "transmission_power")
+        savefig(fig6, csv_path, "transmission_power", save_plots)
 
     # 7) Transmission and Power with Parent Periods (absolute current)
     if has_power and df["avg_current_uA"].notna().any() and all(col in df for col in ["tx_total", "rx_total"]) and "parent_rloc16" in df.columns:
@@ -463,7 +446,7 @@ def main():
         ax4.tick_params(axis='y', labelcolor="tab:blue")
         
         fig7.legend(loc="upper right")
-        savefig(fig7, csv_path, "transmission_power_with_parents")
+        savefig(fig7, csv_path, "transmission_power_with_parents", save_plots)
 
     # Attachment pie and summary
     durations = compute_attachment_durations(df, switches)
@@ -475,33 +458,44 @@ def main():
             print(f"{k}: {v:.2f}s ({pct:.1f}%)")
         switching_s = durations.get("Switching", 0.0)
         print(f"Total Switching Time: {switching_s:.2f}s ({(switching_s/total_s*100):.1f}%)")
-        plot_attachment_pie(durations, csv_path)
+        plot_attachment_pie(durations, csv_path, save_plots)
     else:
         print("No timing information to build attachment pie.")
 
     # Summary
     print("\n--- Summary ---")
+    metrics = {}
     valid_rtt = df["rtt_ms"].dropna()
     if len(valid_rtt):
-        print(f"Average RTT: {valid_rtt.mean():.2f} ms")
-        print(f"Min RTT: {valid_rtt.min():.2f} ms, Max RTT: {valid_rtt.max():.2f} ms")
+        metrics["Avg RTT (ms)"] = round(valid_rtt.mean(), 2)
+        metrics["Min RTT (ms)"] = round(valid_rtt.min(), 2)
+        metrics["Max RTT (ms)"] = round(valid_rtt.max(), 2)
+        print(f"Average RTT: {metrics['Avg RTT (ms)']} ms")
+        print(f"Min RTT: {metrics['Min RTT (ms)']} ms, Max RTT: {metrics['Max RTT (ms)']} ms")
     else:
         print("No RTT data found.")
     
+    total_time_s = (t.max() - t.min()).total_seconds() if len(t) > 1 else 0
+    metrics["Total Time (s)"] = round(total_time_s, 1)
+
     if has_power:
         valid_power = df["avg_current_uA"].dropna()
         if len(valid_power):
             i_avg = valid_power.mean() / 1e6
             v_assumed = 3.0
             p_avg = v_assumed * i_avg
-            print(f"Average Current: {valid_power.mean():.2f} μA")
-            print(f"Min Current: {valid_power.min():.2f} μA, Max Current: {valid_power.max():.2f} μA")
-            print(f"Example Avg Power (at {v_assumed}V): {p_avg * 1000:.2f} mW")
+            metrics["Avg Current (μA)"] = round(valid_power.mean(), 2)
+            metrics["Min Current (μA)"] = round(valid_power.min(), 2)
+            metrics["Max Current (μA)"] = round(valid_power.max(), 2)
+            metrics["Avg Power (mW)"] = round(p_avg * 1000, 2)
+            print(f"Average Current: {metrics['Avg Current (μA)']} μA")
+            print(f"Min Current: {metrics['Min Current (μA)']} μA, Max Current: {metrics['Max Current (μA)']} μA")
+            print(f"Example Avg Power (at {v_assumed}V): {metrics['Avg Power (mW)']} mW")
             if len(t) > 1:
-                total_time_s = (t.max() - t.min()).total_seconds()
                 area_approx = valid_power.mean() * total_time_s / 1e6
                 energy_j = v_assumed * area_approx
-                print(f"Approx Total Energy (area under curve * V): {energy_j:.4f} J over {total_time_s:.1f} s")
+                metrics["Total Energy (J)"] = round(energy_j, 4)
+                print(f"Approx Total Energy (area under curve * V): {metrics['Total Energy (J)']} J over {total_time_s:.1f} s")
             if "state" in df:
                 print("\nAvg Current by State:")
                 print(df.groupby("state")["avg_current_uA"].mean().round(2))
@@ -520,8 +514,115 @@ def main():
     total = len(df)
     detached_rows = sum(str(s).lower() == "detached" for s in df["state"])
     uptime_pct = 100.0 * (1 - detached_rows / total) if total > 0 else 0
+    metrics["Detachments"] = n_detach
+    metrics["Reattachments"] = n_re
+    metrics["Parent Switches"] = n_switch
+    metrics["Uptime (%)"] = round(uptime_pct, 1)
     print(f"Detachments: {n_detach}, Reattachments: {n_re}, Parent switches: {n_switch}")
     print(f"Uptime (child state) = {uptime_pct:.1f}%")
+
+    metrics["Switching Time (s)"] = round(switching_s, 2) if 'switching_s' in locals() else 0
+    metrics["Switching (%)"] = round((switching_s / total_s * 100) if total_s > 0 else 0, 1)
+
+    return metrics, df
+
+# ---------- Main ----------
+def main():
+    parser = argparse.ArgumentParser(description="Analyze OpenThread telemetry CSV with risk metrics.")
+    parser.add_argument("--folder", type=str, default=r"C:\Users\adire\Desktop\nordic_logs",
+                        help="Folder with telemetry CSV")
+    args = parser.parse_args()
+
+    # Ask user if to save screenshots
+    while True:
+        response = input("Save screenshots? (y/n): ").strip().lower()
+        if response in ['y', 'n']:
+            save_plots = response == 'y'
+            break
+        print("Invalid input. Please enter 'y' or 'n'.")
+
+    folder = Path(args.folder)
+    telemetry_glob1 = glob.glob(os.path.join(folder, "correlated_risk_telemetry_*.csv"))
+    telemetry_glob2 = glob.glob(os.path.join(folder, "risk_telemetry_*.csv"))
+    telemetry_glob3 = glob.glob(os.path.join(folder, "*telemetry_*.csv"))
+    telemetry_files = [Path(f) for f in set(telemetry_glob1 + telemetry_glob2 + telemetry_glob3)]
+    
+    if not telemetry_files:
+        raise FileNotFoundError(f"No telemetry CSV found in {folder}")
+
+    telemetry_files.sort(key=extract_timestamp)
+
+    selected_telemetry1 = select_file(telemetry_files, "telemetry")
+    metrics1, df1 = analyze_telemetry(selected_telemetry1, save_plots)
+    file1_name = selected_telemetry1.stem
+
+    # Ask if want to compare
+    while True:
+        response = input("Do you want to compare with another telemetry file? (y/n): ").strip().lower()
+        if response in ['y', 'n']:
+            compare = response == 'y'
+            break
+        print("Invalid input. Please enter 'y' or 'n'.")
+
+    if compare:
+        selected_telemetry2 = select_file(telemetry_files, "telemetry")
+        metrics2, df2 = analyze_telemetry(selected_telemetry2, save_plots)
+        file2_name = selected_telemetry2.stem
+
+        # Comparison
+        print("\n--- Comparison ---")
+        comparison_df = pd.DataFrame({file1_name: metrics1, file2_name: metrics2})
+        print(comparison_df)
+
+        # Plot comparisons
+        output_folder = selected_telemetry1.parent
+        groups = {
+            "RTT": [m for m in comparison_df.index if "RTT" in m],
+            "Current": [m for m in comparison_df.index if "Current" in m],
+            "Power": [m for m in comparison_df.index if "Power" in m or "Energy" in m],
+            "Time": [m for m in comparison_df.index if "Time" in m],
+            "Events": [m for m in comparison_df.index if m in ["Detachments", "Reattachments", "Parent Switches"]],
+            "Percentage": [m for m in comparison_df.index if "(%)" in m],
+        }
+        for group, metrics_list in groups.items():
+            if metrics_list:
+                sub_df = comparison_df.loc[metrics_list].dropna(how='all')
+                if not sub_df.empty:
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    sub_df.T.plot(kind='bar', ax=ax)
+                    ax.set_title(f"{group} Comparison")
+                    ax.set_ylabel(group)
+                    ax.legend(loc='best')
+                    plt.xticks(rotation=0)
+                    if save_plots:
+                        out_path = output_folder / f"comparison_{group.lower()}.png"
+                        fig.savefig(out_path, bbox_inches="tight", dpi=300)
+                        print(f"Saved: {out_path}")
+
+        # Time series comparison line graphs
+        common_cols = set(df1.columns) & set(df2.columns)
+        plot_cols = ["rtt_ms", "lqi_in", "lqi_out", "age_s", "tx_total", "rx_total",
+                     "tx_err_cca", "tx_retry", "rx_err_fcs", "avg_current_uA"]
+        for col in plot_cols:
+            if col in common_cols and df1[col].notna().any() and df2[col].notna().any():
+                fig, ax = plt.subplots(figsize=(12, 6))
+                # Relative time for df1
+                if not df1.empty:
+                    rel_time1 = (df1["timestamp"] - df1["timestamp"].min()).dt.total_seconds()
+                    ax.plot(rel_time1, df1[col], label=file1_name)
+                # Relative time for df2
+                if not df2.empty:
+                    rel_time2 = (df2["timestamp"] - df2["timestamp"].min()).dt.total_seconds()
+                    ax.plot(rel_time2, df2[col], label=file2_name)
+                ax.set_title(f"{col} Comparison over Relative Time")
+                ax.set_xlabel("Relative Time (seconds)")
+                ax.set_ylabel(col)
+                ax.legend()
+                ax.grid(True)
+                if save_plots:
+                    out_path = output_folder / f"comparison_{col}.png"
+                    fig.savefig(out_path, bbox_inches="tight", dpi=300)
+                    print(f"Saved: {out_path}")
     
     plt.show()
 
