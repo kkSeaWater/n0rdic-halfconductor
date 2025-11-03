@@ -1,4 +1,4 @@
-# oracle.py (patched: clearer No-Parent/Has-Parent backgrounds + dotted change lines)
+# oracle.py (per-router backgrounds on Transmission/Power; no dotted lines)
 import pandas as pd
 import os
 from datetime import datetime, timedelta
@@ -16,7 +16,6 @@ import warnings
 import io
 import numpy as np
 from matplotlib.patches import Patch
-from matplotlib.lines import Line2D  # <-- for legend handle of dotted lines
 
 # ---------- Small helpers ----------
 def safe_get_series(df: pd.DataFrame, col: str) -> pd.Series:
@@ -207,28 +206,71 @@ def add_event_markers(ax, df):
             ax.axvline(t, linestyle="--", alpha=0.5,
                        label=label if ev not in ax.get_legend_handles_labels()[1] else "")
 
-def mark_parent_periods(ax, df):
-    if "parent_rloc16" not in df.columns: return
-    uniq = [p for p in df["parent_rloc16"].unique() if p != 'none']
-    if not uniq: return
-    from matplotlib import cm
-    parent_color = {p: cm.Paired(i / len(uniq)) for i, p in enumerate(uniq)}
-    parent_color['none'] = 'lightgray'
-    cur = None; start = None
+# ---------- Per-parent backgrounds (UPDATED) ----------
+def mark_parent_periods(ax, df, alpha=0.55, zorder=0.02):
+    """
+    Background bands by *effective parent* for the axis:
+      - If state is BLANK/empty/NaN OR state=='detached' OR parent_rloc16 in {none,"",nan}
+        => treat as 'No Parent'
+      - otherwise use the parent_rloc16 value.
+    Draws a distinct pink band (No Parent) and stable colors for real parents.
+    """
+    if "timestamp" not in df.columns:
+        return
+
+    # helpers
+    def is_blank_state(v):
+        if pd.isna(v): return True
+        s = str(v).strip().lower()
+        return s == "" or s == "blank"
+
+    def effective_parent(row):
+        parent = str(row.get("parent_rloc16", "none")).strip()
+        st = str(row.get("state", "")).strip().lower()
+        if is_blank_state(row.get("state")) or st == "detached":
+            return "No Parent"
+        if parent == "" or parent.lower() in ("none", "nan"):
+            return "No Parent"
+        return parent
+
+    if df.empty or "timestamp" not in df.columns:
+        return
+
+    # Build an effective-parent series
+    eff = df.apply(effective_parent, axis=1)
+    uniq = list(pd.unique(eff))
+
+    # Color map: 'No Parent' = strong pink; others from tab20
+    no_parent_color = "#f8c8cf"  # clear pink
+    real_parents = [u for u in uniq if u != "No Parent"]
+    base = plt.get_cmap("tab20", max(len(real_parents), 1))
+
+    color_map = {"No Parent": no_parent_color}
+    for idx, p in enumerate(real_parents):
+        color_map[p] = base(idx)
+
+    # Walk rows and draw spans when effective parent changes
+    cur = None
+    start = None
     for _, row in df.iterrows():
-        parent = row["parent_rloc16"]
-        if parent != cur:
+        cur_eff = eff.loc[_]
+        if cur_eff != cur:
             if cur is not None and start is not None:
-                label_text = 'No Parent' if cur == 'none' else cur
+                label = cur
+                already = ax.get_legend_handles_labels()[1]
                 ax.axvspan(start, row["timestamp"],
-                           color=parent_color.get(cur, None), alpha=0.3,
-                           label=label_text if cur not in ax.get_legend_handles_labels()[1] else "")
-            start = row["timestamp"]; cur = parent
+                           color=color_map.get(cur, "#dddddd"),
+                           alpha=alpha, zorder=zorder,
+                           label=label if label not in already else "")
+            start = row["timestamp"]; cur = cur_eff
+
     if cur is not None and start is not None:
-        label_text = 'No Parent' if cur == 'none' else cur
+        label = cur
+        already = ax.get_legend_handles_labels()[1]
         ax.axvspan(start, df["timestamp"].iloc[-1],
-                   color=parent_color.get(cur, None), alpha=0.3,
-                   label=label_text if cur not in ax.get_legend_handles_labels()[1] else "")
+                   color=color_map.get(cur, "#dddddd"),
+                   alpha=alpha, zorder=zorder,
+                   label=label if label not in already else "")
 
 def mark_switch_durations(ax, switches):
     for t0, elapsed, ok in switches:
@@ -238,23 +280,16 @@ def mark_switch_durations(ax, switches):
         ax.text(mid, ax.get_ylim()[1]*0.95, f"{elapsed:.2f}s",
                 ha='center', fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
 
-# ---------- Backgrounds ----------
-def _row_is_no_parent(row):
-    st = str(row.get("state","")).strip().lower()
-    parent = str(row.get("parent_rloc16","")).strip().lower()
-    return st == "detached" or parent in ("", "none", "nan")
-
-def _row_is_has_parent(row):
-    st = str(row.get("state","")).strip().lower()
-    parent = str(row.get("parent_rloc16","")).strip().lower()
-    return (st != "detached") and (parent not in ("", "none", "nan"))
-
-def mark_no_parent_background(ax, df, color="#fbe4e6", alpha=0.55, zorder=0.05):
-    """Red-ish background when there is NO parent (detached/none)."""
+# ---------- Optional backgrounds kept (unused on Transmission/Power) ----------
+def mark_no_parent_background(ax, df, color="#f2dede", alpha=0.45, zorder=0.08):
     if "timestamp" not in df.columns: return
+    def is_no_parent(row):
+        st = str(row.get("state","")).strip().lower()
+        parent = str(row.get("parent_rloc16","")).strip().lower()
+        return st == "detached" or parent in ("", "none", "nan")
     in_span = False; start = None
     for _, row in df.iterrows():
-        t = row["timestamp"]; flag = _row_is_no_parent(row)
+        t = row["timestamp"]; flag = is_no_parent(row)
         if flag and not in_span: start = t; in_span = True
         elif not flag and in_span:
             ax.axvspan(start, t, color=color, alpha=alpha, zorder=zorder); in_span = False
@@ -265,23 +300,7 @@ def mark_no_parent_background(ax, df, color="#fbe4e6", alpha=0.55, zorder=0.05):
         handles.append(Patch(facecolor=color, alpha=alpha, label="No Parent (background)"))
         ax.legend(handles=handles, loc="upper right")
 
-def mark_has_parent_background(ax, df, color="#e7f6e7", alpha=0.5, zorder=0.04):
-    """Green-ish background when there IS a parent (attached)."""
-    if "timestamp" not in df.columns: return
-    in_span = False; start = None
-    for _, row in df.iterrows():
-        t = row["timestamp"]; flag = _row_is_has_parent(row)
-        if flag and not in_span: start = t; in_span = True
-        elif not flag and in_span:
-            ax.axvspan(start, t, color=color, alpha=alpha, zorder=zorder); in_span = False
-    if in_span and start is not None:
-        ax.axvspan(start, df["timestamp"].iloc[-1], color=color, alpha=alpha, zorder=zorder)
-    handles, labels = ax.get_legend_handles_labels()
-    if "Has Parent (background)" not in labels:
-        handles.append(Patch(facecolor=color, alpha=alpha, label="Has Parent (background)"))
-        ax.legend(handles=handles, loc="upper right")
-
-def mark_state_blank_background(ax, df, color="#fff3cd", alpha=0.45, zorder=0.03, hatch=None):
+def mark_state_blank_background(ax, df, color="#fff3cd", alpha=0.45, zorder=0.07, hatch=None):
     """Shade where state is BLANK: NaN, empty string, or literal 'blank' (case-insensitive)."""
     if "timestamp" not in df.columns: return
     def is_blank_state(val):
@@ -299,35 +318,6 @@ def mark_state_blank_background(ax, df, color="#fff3cd", alpha=0.45, zorder=0.03
     handles, labels = ax.get_legend_handles_labels()
     if "State BLANK (background)" not in labels:
         handles.append(Patch(facecolor=color, alpha=alpha, label="State BLANK (background)"))
-        ax.legend(handles=handles, loc="upper right")
-
-# ---------- Dotted boundaries (NEW) ----------
-def draw_parent_change_lines(ax, df, color="black", linestyle=":", linewidth=1.6, alpha=0.9):
-    """
-    Draw a dotted vertical line at every change in:
-      - attached<->no-parent status, or
-      - parent_rloc16 value (including into/out of 'none').
-    """
-    if "timestamp" not in df.columns or "parent_rloc16" not in df.columns:
-        return
-    prev_parent = None
-    prev_has_parent = None
-    for _, row in df.iterrows():
-        t = row["timestamp"]
-        parent = str(row.get("parent_rloc16", "none")).strip().lower()
-        has_parent = _row_is_has_parent(row)
-        # draw if either the parent id changed, or the attached/no-parent status toggled
-        changed = (prev_parent is not None and parent != prev_parent) or (prev_has_parent is not None and has_parent != prev_has_parent)
-        if changed:
-            ax.axvline(t, color=color, linestyle=linestyle, linewidth=linewidth, alpha=alpha)
-        prev_parent = parent
-        prev_has_parent = has_parent
-
-    # add legend handle once
-    handles, labels = ax.get_legend_handles_labels()
-    label = "Parent change / No-parent boundary"
-    if label not in labels:
-        handles.append(Line2D([0], [0], color=color, linestyle=linestyle, linewidth=linewidth, label=label))
         ax.legend(handles=handles, loc="upper right")
 
 def savefig(fig, csv_path, suffix, save_plots):
@@ -372,7 +362,7 @@ def compute_attachment_durations(df, switches=None):
     return durs
 
 def plot_attachment_pie(durations, csv_path, save_plots):
-    if not durations: 
+    if not durations:
         print("No durations to plot for attachment pie.")
         return None
     labels = list(durations.keys()); sizes = list(durations.values())
@@ -512,7 +502,7 @@ def analyze_telemetry(csv_path, save_plots, ppk_delay, window_ms):
         fig6.legend(loc="upper right"); ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S')); plt.xticks(rotation=45)
         savefig(fig6, csv_path, "power", save_plots)
 
-        # Transmission & Power with explicit parent/no-parent backgrounds + dotted boundaries
+        # Transmission & Power with per-parent backgrounds (NO dotted lines)
         delta_tx = tx_total.diff().fillna(0) if has_data(tx_total) else pd.Series(0, index=df.index)
         delta_rx = rx_total.diff().fillna(0) if has_data(rx_total) else pd.Series(0, index=df.index)
         msg_activity = delta_tx + delta_rx
@@ -522,16 +512,13 @@ def analyze_telemetry(csv_path, save_plots, ppk_delay, window_ms):
 
         fig7, ax3 = plt.subplots(figsize=(12, 6))
 
-        # BACKGROUNDS first (behind data): BLANK state, No Parent (red), Has Parent (green)
-        mark_state_blank_background(ax3, df, color="#fff3cd", alpha=0.45, zorder=0.03)   # BLANK state
-        mark_no_parent_background(ax3, df, color="#fbe4e6", alpha=0.55, zorder=0.05)     # No parent (red-ish)
-        mark_has_parent_background(ax3, df, color="#e7f6e7", alpha=0.50, zorder=0.04)    # Has parent (green-ish)
+        # Background: per-parent shading (includes 'No Parent')
+        mark_parent_periods(ax3, df, alpha=0.35, zorder=0.02)
 
-        # DATA
+        # Data
         ax3.plot(t, i, label="Avg Current (μA)", color="tab:red")
-        # NOTE: For this figure we do NOT call mark_parent_periods() to avoid rainbow clutter.
-        # Instead, we use clean has-parent/no-parent backgrounds + dotted boundaries:
-        draw_parent_change_lines(ax3, df, color="black", linestyle=":", linewidth=1.6, alpha=0.9)
+
+        # No dotted parent-change lines here (per your request)
 
         add_event_markers(ax3, df)
         mark_switch_durations(ax3, switches)
@@ -547,14 +534,12 @@ def analyze_telemetry(csv_path, save_plots, ppk_delay, window_ms):
         ax4.set_ylabel("Message Activity (packets)", color="tab:blue")
         ax4.tick_params(axis='y', labelcolor="tab:blue")
 
-        # build a combined legend once
+        # Combined legend
         handles1, labels1 = ax3.get_legend_handles_labels()
         handles2, labels2 = ax4.get_legend_handles_labels()
-        seen = set()
-        handles = []
-        labels = []
+        seen = set(); handles = []; labels = []
         for h, l in list(zip(handles1+handles2, labels1+labels2)):
-            if l not in seen and l != "":
+            if l and l not in seen:
                 handles.append(h); labels.append(l); seen.add(l)
         fig7.legend(handles, labels, loc="upper right")
 
@@ -562,7 +547,7 @@ def analyze_telemetry(csv_path, save_plots, ppk_delay, window_ms):
         ax3.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S')); plt.xticks(rotation=45)
         savefig(fig7, csv_path, "transmission_power_with_parents", save_plots)
 
-        # New graph: Attachment Status Step Plot Correlated with Current
+        # Attachment Status vs Current
         def get_status(row):
             state = str(row.get("state", "")).strip().lower()
             parent = str(row.get("parent_rloc16", "none")).strip().lower()
