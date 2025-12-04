@@ -2,7 +2,7 @@
 """
 pyserial_esp.py
 
-Robust serial logger for esp nRF52 OpenThread CLI (ot-cli).
+
 
 - Continuously reads all serial lines (no data loss).
 - Logs raw lines with timestamps to esp_log_*.txt
@@ -15,7 +15,6 @@ Robust serial logger for esp nRF52 OpenThread CLI (ot-cli).
     - MAC counters: TxTotal, RxTotal, TxErrCca, TxRetry, RxErrFcs
     - Parent switches: "RLOC16 xxxx -> yyyy"
 - Periodically sends: "ot state", "ot parent", "ot counters mac"
-- Learns RLOC IPv6 and builds parent IPv6 EXACTLY like ChildTelemetry_ParentPing.ps1
   (prefix "xxxx:...:0:ff:fe00:" + parentRloc16).
 
 Debugging:
@@ -403,14 +402,14 @@ def run_logger(port: str,
         while time.time() < warmup_end:
             time.sleep(0.1)
 
-        # -------- set TX power + log level (OT CLI with 'ot' prefix) --------
+        # -------- set TX power + log level 
         try:
             print("[INFO] Setting txpower -10 dBm on OpenThread CLI")
-            ser.write(b"ot txpower -20\r\n")
+            ser.write(b"txpower -20\r\n")
             time.sleep(0.1)
 
             print("[INFO] Setting OpenThread log level 5")
-            ser.write(b"ot log level 5\r\n")
+            ser.write(b"log level 5\r\n")
             time.sleep(0.1)
         except serial.SerialException as e:
             print(f"[main] Failed to configure txpower/log level: {e}", file=sys.stderr)
@@ -418,7 +417,7 @@ def run_logger(port: str,
         # -------- DISCOVER RLOC ADDRESS (ipaddr) --------
         try:
             print("[INFO] Requesting ipaddr to learn mesh-local prefix")
-            ser.write(b"ot ipaddr\r\n")
+            ser.write(b"ipaddr\r\n")
             time.sleep(0.2)
         except serial.SerialException as e:
             print(f"[main] Failed to send ipaddr: {e}", file=sys.stderr)
@@ -439,16 +438,16 @@ def run_logger(port: str,
             ping_cmd = None
             if mesh_prefix and parent_rloc16:
                 parent_ip = build_parent_rloc_ipv6(mesh_prefix, parent_rloc16)
-                ping_cmd = f"ot ping {parent_ip}\r\n".encode("ascii")
+                ping_cmd = f"ping {parent_ip}\r\n".encode("ascii")
                 print(f"[main] Will ping parent {parent_ip}")
             else:
                 print(f"[main] No parent_ip yet (mesh_prefix={mesh_prefix}, parent_rloc16={parent_rloc16})")
 
             # Send commands – reader thread will see and parse their output
             try:
-                ser.write(b"ot state\r\n")
-                ser.write(b"ot parent\r\n")
-                ser.write(b"ot counters mac\r\n")
+                ser.write(b"state\r\n")
+                ser.write(b"parent\r\n")
+                ser.write(b"counters mac\r\n")
                 if ping_cmd is not None:
                     ser.write(ping_cmd)
             except serial.SerialException as e:
